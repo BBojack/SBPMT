@@ -1,0 +1,2859 @@
+---
+title: "Experiments"
+author: "Tian Qin"
+date: '2023-11-03'
+output: html_document
+---
+
+### SBPMT complie
+
+```{r}
+
+###complie rcpp file for probitboost first
+
+Rcpp::sourceCpp("C:/Users/63422/Desktop/SBPMT/src/rcpp_wpbt.cpp")
+
+
+### complie working functions for SBPMT
+PMT <- function(xtrain,ytrain,w,depth=5,min_size=20,M=10){
+  
+  base_tree <- rpart(factor(ytrain)~.,data=xtrain,weights=w,control=list(maxdepth=depth,minsplit =min_size))
+  
+  terminal_nodes <- sort(unique(base_tree$where)) #pates0('n',sort(unique(base_tree$where))
+  
+  pbts <- list()#vector("list",length = length(terminal_nodes))
+  
+  for(node in terminal_nodes){
+    index_node <- as.numeric(which(base_tree$where == node))
+    #print(index_node)
+    
+    x_node <- xtrain[index_node,]
+    y_node <- ytrain[index_node]
+    names(y_node)<- row.names(x_node)
+    w_node <- w[index_node]
+    if(length(unique(y_node))==1){
+      
+      pbts[[paste0("n",node)]] <- list(predicted=unique(y_node),unique=TRUE,fitted=y_node)
+    }else{
+      
+      fit <- WoProbitBoost(x_node, y_node, Wo=w_node, M_max = M)
+      names(fit$fitted_p)<- row.names(x_node)
+      pbts[[paste0("n",node)]] <-list(boost_feats=fit$boost_feat,local_nodes=index_node,fitted=fit$fitted_p, ynode=y_node,unique=FALSE)#MWProbitBoost(x_node, y_node, Wo=w_node,M_max=M,aic=aic)
+    }
+    
+    
+    #LogitBoost(x_node, y_node, nIter = ncol(x_node)) #WoProbitBoost(x_node, y_node, Wo=w_node,M_max=M,aic=aic)$boost_feat #PB(x_node,y_node,M=M,aic=aic,depth = depth,min_size = min_size)
+    
+  }
+  #object <- list(pbt=pbts,terminal_nodes=terminal_nodes)
+  
+  return(list(tree=base_tree,pbt=pbts,terminal_nodes=terminal_nodes))
+}
+
+
+
+
+pmt.predict<- function(pmt_list,new_data){
+  
+  tree <- pmt_list$tree
+  ter_nodes <- pmt_list$terminal_nodes
+  
+  #pbts <- pmt_list$pbt
+  
+  pred_nodes_index <- rpart:::pred.rpart(tree, rpart:::rpart.matrix(new_data))
+  pred_nodes <- paste0("n",as.numeric(pred_nodes_index))
+  
+  predicted <- predictProbit(as.matrix(new_data),pmt_list,pred_nodes) #numeric(length = length(pred_nodes))
+  
+  
+  return(predicted)
+}
+
+
+AdaPMT <- function(ms=10,M=5,depth=5,trainx,trainy,xtest,step=0.5,w_init,tpx_init,size=15,lab_list){
+  n <- length(trainy)
+  
+  tpx <- tpx_init
+  cpx <- tpx
+  w <- w_init
+  px <- numeric(n)
+  re <- 0
+  n_Class <- length(unique(trainy))
+  Cx <- matrix(0,ncol=n_Class,nrow(xtest))
+  lab_list <- lab_list#as.vector(sort(unique(trainy)))
+  if(n_Class==2){
+    for(m in 1:ms){
+      # print(w)
+
+      pmt <- PMT(trainx,trainy,w=w,depth=depth,M=M,min_size=size)
+      terminode <- paste0("n",pmt$terminal_nodes)
+      
+      pred <- ifelse(do.call("c",lapply(terminode,function(node) pmt$pbt[[node]]$fitted ))>0.5,1,0)
+
+      #print(Ix)
+      #print(pred[names(trainy)])
+      # pred <- ifelse(pmt.predict2(pmt,trainx)>0.5,1,0)
+      Ix <- ifelse(pred[names(trainy)]!=trainy,1,0)
+      err <- sum(w*Ix)/(sum(w))
+      
+      
+      alpha <-step*log((1-err+1e-24)/(err+1e-24))
+      
+      w <- w*exp(alpha*Ix)
+      w <- w/sum(w)
+      # print(pmt$pbt)
+      
+      
+      test <- pmt.predict(pmt,xtest)
+      # print(test)
+      
+      test <- ifelse(test>0.5,1,-1)  
+      
+      tpx <-  tpx +test*alpha
+      
+      #tpx <-  tpx +test*alpha
+      #  print(m)
+      
+    } 
+    return(tpx)
+  }else{
+    
+    for(m in 1:ms){
+      boost_feat_train <- matrix(-Inf,ncol=n_Class,nrow=n)   
+      boost_feat_test<- matrix(-Inf,ncol=n_Class,nrow=nrow(xtest))   # ... recursivly
+      for (jClass in 1:n_Class) {
+        #print('loop')
+        y = as.numeric(trainy==lab_list[jClass]) # lablist[jClass]->1; rest->0
+        pmt <- PMT(trainx,y,w=w,depth=depth,M=M,min_size=size)
+        #pred <- pmt.predict(pmt,trainx,K2)
+        
+        terminode <- paste0("n",pmt$terminal_nodes)
+        pj <- do.call("c",lapply(terminode,function(node) pmt$pbt[[node]]$fitted ))
+        boost_feat_train[,jClass] <- pj[names(trainy)]# ifelse(do.call("c",lapply(terminode,function(node) pmt$pbt[[node]]$fitted ))>0.5,1,0)#pmt.predict2(pmt,trainx)#pmt$predict(trainx)
+        
+        boost_feat_test[,jClass] <- pmt.predict(pmt,xtest)
+      }
+      pred <- apply(boost_feat_train,1,function(row) lab_list[which.max(row)] )
+      # print(boost_feat_train)
+      #print(pred)
+      #  pred <- ifelse(pmt$predict(trainx)>0,lablist[2],lablist[1])
+      Ix <- ifelse(pred!=trainy,1,0)
+      
+      err <- sum(w*Ix)/(sum(w))
+      
+      
+      alpha <-step*log((1-err+1e-24)/(err+1e-24))+log(n_Class-1)
+      
+      w <- w*exp(alpha*Ix)
+      w <- w/sum(w)
+      
+      test <- apply(boost_feat_test,1,function(row) which.max(row) )#ifelse(pmt$predict(xtest)==1,1,-1)  
+      
+      
+      for(row in 1:nrow(xtest)){
+        
+        Cx[row,test[row]] <- Cx[row,test[row]] +alpha
+      }
+      
+      #print(m)
+      
+      
+    }
+    
+    
+    return(Cx)
+    
+    
+    
+  }
+  
+}
+
+
+
+SBPMT <- function(n_tree=20,n_iteration=5,M=5,depth=5,xtrain,ytrain,xtest,step=0.5,size=15,alpha=0.7,seed=NULL){
+  
+  # n_tree <- n_tree
+  # n_iteration <- n_iteration
+  # 
+  if(is.null(xtest)){
+    xtest=xtrain
+  }
+  lab_list = as.vector(sort(unique(ytrain)))
+  if(length(unique(ytrain))==2){
+    
+    rf_test <- matrix(0,ncol=n_tree,nrow=nrow(xtest))#$numeric(nrow(xtest))
+    hist_accs <- numeric(n_tree)
+    if(!is.null(seed)){
+      set.seed(42)
+    }
+
+    for(n in 1:n_tree){
+      
+      samp_index <-  sample(1:nrow(xtrain),size=ceiling(alpha*nrow(xtrain)),replace = FALSE) #sample(1:nrow(xtrain),replace = TRUE)
+      samp_fea <- 1:ncol(xtrain)#sample(1:ncol(xtrain),size=floor(sqrt(ncol(xtrain))),replace = FALSE)
+      usp <- unique(samp_index)
+      #print(length(usp))
+      x_rf <- xtrain[samp_index,]
+      y_rf <- ytrain[samp_index]
+      
+      w_init <- rep(1/length(usp),length(usp))
+      
+      tpx_init <- numeric(nrow(xtest))
+      
+      
+      tpx_rf <- AdaPMT(ms=n_iteration,M=M,depth=depth,trainx=x_rf,trainy=y_rf,xtest=xtest,step=step,tpx_init=tpx_init,w_init=w_init,size=size,lab_list=lab_list)
+      rf_test[,n] <- ifelse(tpx_rf>0,1,-1)
+      
+      
+    }
+    pred_binary <- apply(rf_test,1,function(row) ifelse(sum(row)>0,lab_list[2],lab_list[1]))
+    return(pred_binary)
+    
+  }else if(length(unique(ytrain))>2){#multi-class, one-vs-all strategy used
+    
+    
+    rf_test <- array(0,dim=c(n_tree,nrow(xtest),length(unique(ytrain))))#matrix(0,ncol=n_tree,nrow=nrow(xtest))#$numeric(nrow(xtest))
+    hist_accs <- numeric(n_tree)
+    
+    
+    for(n in 1:n_tree){
+      
+      samp_index <- sample(1:nrow(xtrain),size=alpha*nrow(xtrain),replace = FALSE)#sample(1:nrow(xtrain),replace = TRUE)
+      samp_fea <-   sample(1:ncol(xtrain),size=floor(sqrt(ncol(xtrain))),replace = FALSE)#1:ncol(xtrain) #unique(sample(1:ncol(xtrain),replace = TRUE))#unique(sample(1:ncol(xtrain),replace = TRUE)
+      usp <- unique(samp_index)
+      #print(length(usp))
+      x_rf <- xtrain[samp_index,]
+      y_rf <- ytrain[samp_index]
+ 
+      w_init <- rep(1/length(samp_index),length(samp_index))
+      
+      tpx_init <- numeric(nrow(xtest))
+      
+      tpx_rf <- AdaPMT(ms=n_iteration,M=M,depth=depth,trainx=x_rf,trainy=y_rf,xtest=xtest,step=step,tpx_init=tpx_init,w_init=w_init,size=size,lab_list=lab_list)
+
+      rf_test[n,,] <-tpx_rf 
+
+      
+    }
+    
+    
+    weights <- hist_accs/sum(hist_accs)
+    
+    pred_multi<- apply(apply(rf_test,c(1,2),function(block) which.max(block)  ), 2,function(col) lab_list[as.numeric(names(which.max(table(col))))])
+    
+    return(pred_multi)
+    
+  }
+
+}
+
+
+
+
+
+
+
+
+```
+
+
+
+### Ionosphere
+```{r}
+library(randomForest)
+library(dplyr)
+library(gbm)
+#library(SBPMT) 
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+ionosphere <- read.csv('ionosphere.data',
+                   sep= ",", header=FALSE)
+#n <- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/ionosphere/ionosphere.names'))
+ df <-ionosphere
+library(rpart)
+set.seed(42)
+df<-df[sample(nrow(df)),]
+df <- df[,-2]
+df[,1:33] <- as.data.frame(scale(df[,1:33]))
+df$V35 <- as.numeric(as.factor(df$V35))-1
+#Create 10 equally size folds
+folds <-  caret::createFolds(factor(df$V35), k = 10,list = FALSE) #cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:33]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,34]
+    xtrain <- df[-testIndexes, 1:33]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,34] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+    ### gbm
+
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+     ytrain <- factor(ytrain)
+        treer <- randomForest(ytrain~., data = xtrain)
+    p <-predict(treer, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+    data_adb <- df[-testIndexes,]
+    data_adb$V35 <- as.factor(data_adb$V35)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V35~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:33])
+    train_label  <- df[-testIndexes,34]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:33])
+    test_label <-  df[testIndexes,34]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+    
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+###Australian
+
+```{r}
+aus <- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/australian/australian.dat'),
+                   sep= " ", header=FALSE, col.names =paste('A',seq(1:15)))
+
+# aus$A.15 <- as.numeric(as.factor(aus$A.15 ))-1
+# y <- aus$A.15
+#model.matrix( ~ .-1, aus[,2:15])
+#xdata <- as.data.frame(model.matrix( ~ .-1, aus[,1:14]))#data.frame(A3=as.numeric(aus$A.3),A5=as.factor(aus$A.5))
+library(caret)
+df <- aus
+library(rpart)
+set.seed(42)
+#df[,1:14] <- as.data.frame(scale(df[,1:14]))
+# tree <- rpart(train_y~., data = train_x)
+# p <- ifelse(predict(tree, train_x)>0.5,1,0)
+# confmatrix_tree <-table(p, train_y)
+# confmatrix_tree
+ df$A.1 <- as.factor(df$A.1)
+ df$A.4 <- as.factor(df$A.4)
+ df$A.5 <- as.factor(df$A.5)
+ df$A.6 <- as.factor(df$A.6)
+ df$A.8 <- as.factor(df$A.8)
+ df$A.9 <- as.factor(df$A.9)
+ df$A.11 <- as.factor(df$A.11)
+ df$A.12<- as.factor(df$A.12)
+ dmy<- dummyVars(" ~A.1+ A.4 + A.5+A.6+A.8+A.9+A.11+A.12", data = df)
+ cat_df <-  data.frame(predict(dmy, newdata = df))
+ num_df <- df[,c('A.2','A.3','A.7','A.10','A.13','A.14','A.15')]
+# 
+processed_df <- as.data.frame(scale(cbind(cat_df,num_df)))
+processed_df['A.15'] <- df$A.15
+processed_df[,1:14] <- scale(processed_df[,1:14])
+processed_df<-processed_df[sample(nrow(processed_df)),]
+folds <-caret::createFolds(factor(processed_df$A.15), k = 10,list = FALSE)
+
+
+
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10 ){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- processed_df[testIndexes, 1:42]
+    ytest <- processed_df[testIndexes,43]
+    xtrain <- processed_df[-testIndexes, 1:42]
+    ytrain <- processed_df[-testIndexes,43]
+    names(ytrain) <- row.names(xtrain)
+    #Use the test and train data partitions however you desire...
+    
+
+   
+     
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+    ###GradientBoost
+        gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ### RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- processed_df[-testIndexes,]
+     data_adb$A.15<- as.factor(data_adb$A.15)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(A.15~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=processed_df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+        ###Xgboost(100)
+        train_data   <- as.matrix(processed_df[-testIndexes,1:42])
+train_label  <- processed_df[-testIndexes,43]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- as.matrix(processed_df[testIndexes,1:42])
+test_label <-  processed_df[testIndexes,43]#as.numeric(ytest)-1
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+numberOfClasses <- length(unique(ytrain))
+xgb_params <- list("objective" = "multi:softmax",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses,
+                   "subsample"=0.7)
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    ###Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+###Diabetic
+
+```{r}
+
+Diabetic <- read.arff(url('https://archive.ics.uci.edu/ml/machine-learning-databases/00329/messidor_features.arff'))
+
+ df <-Diabetic
+ names(df)[1:19] <- paste0('V',seq(1:19))
+ df$Class <- as.numeric(df$Class)-1
+ df[,1:19] <- scale(df[,1:19])
+ #df <- df[,!names(df)%in%c('V9','V10','V11','V12','V13','V14','V15','V16','V17','V18')]
+#df <- df[,3:length(colnames(df))]
+#df$V11 <- ifelse(df$V11==4,1,0)
+# xtrain <- leukemia[,2:102]
+# ytrain <- as.factor(leukemia[,1])
+# 
+# lmt <- LMT(ytrain~.,data=xtrain)
+# table(ytrain,predict(lmt,xtrain))# pred(lmt,xtrain)
+
+#as.numeric(leukemia)
+set.seed(42)
+df<-df[sample(nrow(df)),]
+#names(df)[1:19] <- paste0('V',seq(1,19))
+#library(PMT)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$Class), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:19]
+    ytest <- df[testIndexes,20]
+    xtrain <- df[-testIndexes, 1:19]
+    ytrain <- df[-testIndexes,20] 
+    # # 
+    names(ytrain) <- row.names(xtrain)
+      
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    ###GradientBoost
+        gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ###RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+    #ytrain <- factor(ytrain)
+ 
+
+    
+    ###Aadaboost
+         data_adb <- df[-testIndexes,]
+     data_adb$Class<- as.factor(data_adb$Class)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(Class~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+     
+    ###Xgboos(100)
+         train_data   <- as.matrix(df[-testIndexes,1:19])
+train_label  <- df[-testIndexes,20]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- as.matrix(df[testIndexes,1:19])
+test_label <-  df[testIndexes,20]#as.numeric(ytest)-1
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+numberOfClasses <- length(unique(ytrain))
+
+bst_model <- xgb.train(
+                       data = train_matrix,nrounds=100,subsample=0.7)
+
+# Predict hold-out test set
+test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10,subsample=0.7)
+
+# Predict hold-out test set
+test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+   
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+
+
+
+### pima_indians
+```{r}
+library(randomForest)
+library(dplyr)
+library(gbm)
+#library(SBPMT)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+pima_indians <- read.csv('diabetes.csv')
+
+
+ df <-pima_indians
+ fn <- colnames(df)[2:(length(colnames(df))-1)]
+df <- df %>% mutate(across(.cols = fn,
+                           .fns = ~ifelse(.x == 0, mean(.x), .x)))
+
+library(rpart)
+
+
+df['Response'] <- pima_indians$Outcome
+
+set.seed(42)
+df<-df[sample(nrow(df)),]
+#Create 10 equally size folds
+#folds <-cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+folds <- caret::createFolds(factor(df$Response), k = 10,list = FALSE) 
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:8]
+    ytest <- df[testIndexes,9]
+    xtrain <- df[-testIndexes,1:8]
+    ytrain <- df[-testIndexes,9]
+        names(ytrain) <- row.names(xtrain)
+
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+    ### gbm
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ### Adaboost
+         data_adb <- df[-testIndexes,c(1:8,10)]
+     data_adb$Response<- as.factor(data_adb$Response)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(Response~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,c(1:8,10)])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:8])
+    train_label  <- df[-testIndexes,9]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:8])
+    test_label <-  df[testIndexes,9]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    
+    ### Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+        cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+        print(cvxg10[i])
+     
+}
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+### German
+
+```{r}
+# 
+library(RWeka)
+
+German <- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data'),
+                   sep= " ", header=FALSE)
+
+ df <-German
+
+
+library(caret)
+dmy<- dummyVars(" ~ V1 + V3+V4+V6+V7+V9+V10+V12+V14+V15+V17+V19+V20", data = df)
+cat_df <-  data.frame(predict(dmy, newdata = df))
+num_df <- df[,c('V2','V5','V8','V11','V13','V16','V18','V21')]
+
+processed_df <- cbind(cat_df,num_df)
+processed_df$V21 <- ifelse(processed_df$V21 ==2,1,0)
+library(rpart)
+set.seed(42)
+processed_df<-processed_df[sample(nrow(processed_df)),]
+#library(PMT)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(processed_df$V21), k = 10,list = FALSE) #cut(seq(1,nrow(processed_df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10){
+    #Segement your data by fold using the which() function
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- processed_df[testIndexes, 1:61]
+    ytest <- processed_df[testIndexes,62]
+    xtrain <- processed_df[-testIndexes, 1:61]
+    ytrain <- processed_df[-testIndexes,62]
+    names(ytrain) <- row.names(xtrain)
+    #Use the test and train data partitions however you desire...
+
+
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+    ### GradientBoost
+        gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ### AdaBoost
+    data_adb <- processed_df[-testIndexes,]
+    data_adb$V21<- as.factor(data_adb$V21)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V21~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=processed_df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(processed_df[-testIndexes,1:61])
+    train_label  <- processed_df[-testIndexes,62]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(processed_df[testIndexes,1:61])
+    test_label <-  processed_df[testIndexes,62]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+    
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+     
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+### Biodegeneration
+
+```{r}
+library(RWeka)
+
+library(rpart)
+
+bio <- read.table(url('https://archive.ics.uci.edu/ml/machine-learning-databases/00254/biodeg.csv'), sep=';',header=FALSE)
+
+ df <-bio
+ df$V42 <- ifelse(df$V42=='RB',1,0)
+
+set.seed(42)
+ df[,1:41] <- scale(df[,1:41])
+df<-df[sample(nrow(df)),]
+#names(df)[1:19] <- paste0('V',seq(1,19))
+#library(PMT)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$V42), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:41]
+    ytest <- df[testIndexes,42]
+    xtrain <- df[-testIndexes, 1:41]
+    ytrain <- df[-testIndexes,42] 
+    names(ytrain) <- row.names(xtrain)
+    #Use the test and train data partitions however you desire...
+        
+   ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+    ###  GradientBoost
+
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    # 
+     ### RandomForest
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    #Adaboost
+    data_adb <- df[-testIndexes,]
+    data_adb$V42<- as.factor(data_adb$V42)
+
+    ada.model = boosting(V42~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    train_data   <- as.matrix(df[-testIndexes,1:41])
+    train_label  <- df[-testIndexes,42]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:41])
+    test_label <-  df[testIndexes,42]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+    
+
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+     
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+
+
+
+### Balance scale
+
+```{r}
+
+bs<- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/balance-scale/balance-scale.data'),
+                   sep= ",", header=FALSE)
+#library(SBPMT)
+library(dplyr)
+library(adabag)
+library(xgboost)
+library(gbm)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(randomForest)
+library(rpart)
+set.seed(42)
+df<-bs[sample(nrow(bs)),]
+
+library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$V1), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 2:5]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,1]
+    xtrain <- df[-testIndexes, 2:5]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,1] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ### SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+
+    ### GradientBoost
+# define parameters
+    lab_list = as.vector(sort(unique(ytrain)))
+    n_Class <- length(unique(ytrain))
+    boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+    for (jClass in 1:n_Class) {
+      #print('loop')
+      yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+      gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+      boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+    }
+    pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+    
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+    
+    
+    ### AdaBoost
+    data_adb <- df[-testIndexes,]
+    data_adb$V1<- as.factor(data_adb$V1)
+    ada.model = boosting(V1~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### XgBoost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,2:5])
+    train_label  <- as.numeric(as.factor(df[-testIndexes,1]))-1
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,2:5])
+    test_label <-  as.numeric(as.factor(df[testIndexes,1]))-1#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+    test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### XgBoost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+    test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+
+###vehicle
+
+```{r}
+
+
+files <- c('xaa.dat','xab.dat','xac.dat','xad.dat','xae.dat','xaf.dat','xag.dat','xah.dat','xai.dat')
+dfs <- c()
+for(name in files){
+  
+  temp <- read.table(url(paste0("https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/vehicle/", name)),header = FALSE) #col.names =paste('V',seq(1:19)))
+  #print(df)
+  dfs <- rbind(dfs,temp)
+  
+}
+#ve <- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/ionosphere/ionosphere.names'))
+ df <-dfs[complete.cases(dfs), ]
+ 
+ #library(rpart)
+set.seed(42)
+df<-df[sample(nrow(df)),]
+#library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df[,19]), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:18]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,19]
+    xtrain <- df[-testIndexes, 1:18]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,19] 
+    names(ytrain) <- row.names(xtrain)
+    
+
+    ### SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+   
+    
+    ### GradientBoost
+# define parameters
+    lab_list = as.vector(sort(unique(ytrain)))
+    n_Class <- length(unique(ytrain))
+    boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+            for (jClass in 1:n_Class) {
+              #print('loop')
+              yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+            gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    
+              boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+            }
+            pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    # 
+    ### RandomForest
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- df[-testIndexes,]
+     data_adb$V19<- as.factor(data_adb$V19)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V19~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ###Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:18])
+    train_label  <- as.numeric(as.factor(df[-testIndexes,19]))-1
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:18])
+    test_label <-  as.numeric(as.factor(df[testIndexes,19]))-1#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+
+    test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+
+    test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+###Glass
+
+```{r}
+
+library(randomForest)
+library(dplyr)
+library(gbm)
+#library(BPMT)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+
+# glass<- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/glass/glass.data'),
+#                    sep= ",", header=FALSE)
+glass <- read.csv('glass.csv')
+ df <-glass
+#df$Species <- ifelse(df$Species=='versicolor',1,0)#as.numeric(as.factor(df$Class))-1
+set.seed(42)
+df<-df[sample(nrow(df)),]
+
+
+df$Type.of.glass <- ifelse(df$Type.of.glass==5,4,df$Type.of.glass)
+df$Type.of.glass <- ifelse(df$Type.of.glass==6,5,df$Type.of.glass)
+df$Type.of.glass <- ifelse(df$Type.of.glass==7,6,df$Type.of.glass)
+#names(df)[1:19] <- paste0('V',seq(1,19))
+#library(PMT)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df[,11]), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 2:10]
+    ytest <- df[testIndexes,11]
+    xtrain <- df[-testIndexes, 2:10]
+    ytrain <- df[-testIndexes,11] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ### SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-confusionMatrix(as.factor(sbpmt_pred), as.factor(as.numeric(ytest)))#table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft$table))/sum(rft$table)
+    print(cvbpbtrf[i])
+    
+    ### GradientBoost
+
+# define parameters
+    lab_list = as.vector(sort(unique(ytrain)))
+    n_Class <- length(unique(ytrain))
+    boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+      for (jClass in 1:n_Class) {
+        #print('loop')
+        yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+      gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+
+        boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+      }
+      pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+      
+    ###RandomForest
+
+     ytrain <- factor(ytrain)
+     
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+    data_adb <- df[-testIndexes,2:11]
+     data_adb$Type.of.glass<- as.factor(data_adb$Type.of.glass)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(Type.of.glass~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,2:11])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ###Xgboos(100)
+
+    train_data   <- as.matrix(df[-testIndexes,2:10])
+    train_label  <- df[-testIndexes,11]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,2:10])
+    test_label <-  df[testIndexes,11]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses+1,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+    test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+    test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+
+```
+
+###breast-cancer
+
+```{r}
+
+bc <- read.csv('https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data',header = FALSE)
+
+# aus$A.15 <- as.numeric(as.factor(aus$A.15 ))-1
+# y <- aus$A.15
+#model.matrix( ~ .-1, aus[,2:15])
+#xdata <- as.data.frame(model.matrix( ~ .-1, aus[,1:14]))#data.frame(A3=as.numeric(aus$A.3),A5=as.factor(aus$A.5))
+
+ df <-bc
+
+df$V2 <- as.numeric(as.factor(df$V2))-1
+set.seed(42)
+df<-df[sample(nrow(df)),]
+
+folds <- caret::createFolds(factor(df$V2), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10<- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 3:32]
+    ytest <- df[testIndexes,2]
+    xtrain <- df[-testIndexes, 3:32]
+    ytrain <- df[-testIndexes,2] 
+    names(ytrain) <- row.names(xtrain)
+
+    
+    ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+   ###GradientBoost
+        gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    # 
+    ###RandomForest
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (confmatrix_treer[1,1]+confmatrix_treer[2,2])/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+    data_adb <- df[-testIndexes,2:32]
+    data_adb$V2<- as.factor(data_adb$V2)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V2~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,2:32])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboos(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,3:32])
+    train_label  <- df[-testIndexes,2]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,3:32])
+    test_label <-  df[testIndexes,2]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    
+    bst_model <- xgb.train(
+                           data = train_matrix,nrounds=100,subsample=0.7)
+
+# Predict hold-out test set
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+        cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+        print(cvxg[i])
+    
+      ###Xgboost(10)
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10,subsample=0.7)
+
+
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+
+
+```
+
+
+### Rasin
+
+
+```{r}
+
+Raisin <- read.csv('Raisin_Dataset.csv',header = TRUE)
+
+
+ df <-Raisin
+df$Class <- as.numeric(as.factor(df$Class))-1
+set.seed(42)
+df<-df[sample(nrow(df)),]
+
+folds <- caret::createFolds(factor(df[,8]), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:7]
+    ytest <- df[testIndexes,8]
+    xtrain <- df[-testIndexes, 1:7]
+    ytrain <- df[-testIndexes,8] 
+    names(ytrain) <- row.names(xtrain)
+    #Use the test and train data partitions however you desire...
+
+ 
+
+   ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+
+   ### GradientBoost
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+    data_adb <- df[-testIndexes,]
+     data_adb$Class<- as.factor(data_adb$Class)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(Class~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:7])
+    train_label  <- df[-testIndexes,8]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:7])
+    test_label <-  df[testIndexes,8]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=100,subsample=0.7)
+
+
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10,subsample=0.7)
+
+# Predict hold-out test set
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+    
+}
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+
+
+```
+
+
+### Banknote
+
+```{r}
+
+
+library(randomForest)
+library(dplyr)
+library(gbm)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+
+Banknote <- read.csv('data_banknote_authentication.txt',
+                   sep= ",", header=FALSE, col.names =paste('V',seq(1:5)))
+
+ df <-Banknote
+#df$Species <- ifelse(df$Species=='versicolor',1,0)#as.numeric(as.factor(df$Class))-1
+set.seed(42)
+df<-df[sample(nrow(df)),]
+
+
+
+folds <- caret::createFolds(factor(df$V.5), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:4]
+    ytest <- df[testIndexes,5]
+    xtrain <- df[-testIndexes, 1:4]
+    ytrain <- df[-testIndexes,5] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+  
+    ###gbm
+
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ### RandomForest
+     ytrain <- factor(ytrain)
+        treer <- randomForest(ytrain~., data = xtrain)
+    p <-predict(treer, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ### Adaboost
+     data_adb <- df[-testIndexes,]
+     data_adb$V.5 <- as.factor(data_adb$V.5)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V.5~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:4])
+    train_label  <- df[-testIndexes,5]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:4])
+    test_label <-  df[testIndexes,5]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(
+                           data = train_matrix,nrounds=100)
+
+
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    
+ xgb_params10<- list("objective" = "binary:logistic",
+                   "num_class" = numberOfClasses)   
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+
+```
+
+
+
+#Tic-tac-toe
+
+```{r}
+
+
+library(randomForest)
+library(dplyr)
+library(gbm)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+
+ttt<- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/tic-tac-toe/tic-tac-toe.data'),
+                   sep= ",", header=FALSE)
+
+ df <-ttt
+#df$Species <- ifelse(df$Species=='versicolor',1,0)#as.numeric(as.factor(df$Class))-1
+set.seed(42)
+df<-df[sample(nrow(df)),]
+
+target <- as.numeric(as.factor(df$V10))-1
+dmy<- dummyVars(" ~V1+ V2 + V3+V4+V5+V6+V7+V8+V9", data = df)
+cat <- data.frame(predict(dmy, newdata = df))
+processed_df <- cbind(cat,target)
+
+
+folds <- caret::createFolds(factor(processed_df$target), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- processed_df[testIndexes, 1:27]
+    ytest <- processed_df[testIndexes,28]
+    xtrain <- processed_df[-testIndexes, 1:27]
+    ytrain <- processed_df[-testIndexes,28]
+    names(ytrain) <- row.names(xtrain)
+    
+    ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+
+    ###GradientBoost
+
+      gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ### RandomForest
+     ytrain <- factor(ytrain)
+        treer <- randomForest(ytrain~., data = xtrain)
+    p <-predict(treer, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ### Adaboost
+     data_adb <- processed_df[-testIndexes,]
+     data_adb$target <- as.factor(data_adb$target)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(target~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=processed_df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ###Xgboost(100)
+    
+    train_data   <- as.matrix(processed_df[-testIndexes,1:27])
+    train_label  <- processed_df[-testIndexes,28]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(processed_df[testIndexes,1:27])
+    test_label <-  processed_df[testIndexes,28]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(
+                           data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    
+ xgb_params10<- list("objective" = "binary:logistic",
+                   "num_class" = numberOfClasses)   
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+
+```
+
+
+
+
+
+#Contraceptive-method-choice
+
+```{r}
+library(dplyr)
+# library(dplyr)
+#library(PMT)
+#library(lightgbm) 
+ library(caret)
+library(rpart)
+library(RWeka)
+library(randomForest)
+cmc<- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/cmc/cmc.data'),
+                   sep= ",", header=FALSE)
+
+
+
+library(rpart)
+set.seed(42)
+df<-cmc[sample(nrow(cmc)),]
+ df$V2 <- as.factor(df$V2)
+ df$V3 <- as.factor(df$V3)
+ df$V7 <- as.factor(df$V7)
+ df$V8<- as.factor(df$V8)
+
+  dmy<- dummyVars(" ~V2 + V3+ V7+V8", data = df)
+ cat_df <-  data.frame(predict(dmy, newdata = df))
+ num_df <- df[,c('V1','V4','V5','V6','V9','V10')]
+# 
+processed_df <- as.data.frame(cbind(cat_df,num_df))
+
+
+library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$V10), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- processed_df[testIndexes, 1:21]
+    #xtest<- xtest[,-2]
+    ytest <- processed_df[testIndexes,22]
+    xtrain <- processed_df[-testIndexes, 1:21]
+    #xtrain <- xtrain[,-2]
+    ytrain <- processed_df[-testIndexes,22] 
+    names(ytrain) <- row.names(xtrain)
+    
+    
+
+        ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+   ### GradientBoost
+
+
+# define parameters
+  lab_list = as.vector(sort(unique(ytrain)))
+n_Class <- length(unique(ytrain))
+boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+        for (jClass in 1:n_Class) {
+          #print('loop')
+          yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+        gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+
+          boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+        }
+        pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- processed_df [-testIndexes,]
+     data_adb$V10<- as.factor(data_adb$V10)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V10~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=processed_df [testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+            train_data   <- as.matrix(processed_df [-testIndexes,1:21])
+    train_label  <- as.numeric(as.factor(processed_df [-testIndexes,22]))-1
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(processed_df [testIndexes,1:21])
+    test_label <-  as.numeric(as.factor(processed_df [testIndexes,22]))-1#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+#Iris
+
+```{r}
+
+
+
+library(rpart)
+set.seed(42)
+df<-iris  
+
+
+
+library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$Species), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:4]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,5]
+    xtrain <- df[-testIndexes, 1:4]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,5] 
+    
+    names(ytrain) <- row.names(xtrain)
+
+
+        ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+    ###GradientBoost
+
+# define parameters
+  lab_list = as.vector(sort(unique(ytrain)))
+n_Class <- length(unique(ytrain))
+boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+        for (jClass in 1:n_Class) {
+          #print('loop')
+          yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+        gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+
+          boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+        }
+        pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- df[-testIndexes,]
+     data_adb$Species<- as.factor(data_adb$Species)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(Species~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df [testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ###Xgboost(100)
+    
+    train_data   <- as.matrix(df [-testIndexes,1:4])
+    train_label  <- as.numeric(as.factor(df [-testIndexes,5]))-1
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df [testIndexes,1:4])
+    test_label <-  as.numeric(as.factor(df [testIndexes,5]))-1#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses,
+                       "subsample"=0.7)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+    
+    # Predict hold-out test set
+    test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+
+
+
+#Burst Header Packet
+
+```{r}
+
+BHP <- read.arff(url('https://archive.ics.uci.edu/ml/machine-learning-databases/00404/OBS-Network-DataSet_2_Aug27.arff'))
+  #read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/letter-recognition/letter-recognition.data'),
+                  # sep= ",", header=FALSE)
+colnames(BHP) <- paste0('V',1:22)
+#write.csv(letter,'letter.csv')
+
+library(rpart)
+set.seed(42)
+
+df<-BHP[sample(nrow(BHP)),]
+
+df$V22 <- ifelse(df$V22=='NB-No Block',1,df$V22)
+df$V22 <- ifelse(df$V22=='Block',2,df$V22)
+df$V22 <- ifelse(df$V22=='No Block',3,df$V22)
+df$V22 <- ifelse(df$V22=='NB-Wait',4,df$V22)
+df$V20 <- ifelse(df$V20=='B',1,0)
+
+df<- df[complete.cases(df),]
+1-nrow(df)/nrow(BHP)
+
+
+library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$V22), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:21]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,22]
+    xtrain <- df[-testIndexes, 1:21]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,22] 
+    names(ytrain) <- row.names(xtrain)
+    
+        ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+
+### GradientBoost
+
+  lab_list = as.vector(sort(unique(ytrain)))
+n_Class <- length(unique(ytrain))
+boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+        for (jClass in 1:n_Class) {
+          #print('loop')
+          yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+        gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+
+          boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+        }
+        pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ### RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- df[-testIndexes,1:22]
+     data_adb$V22<- as.factor(data_adb$V22)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V22~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,1:22])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ###Xgboost(100)
+    
+            train_data   <- as.matrix(df [-testIndexes,1:21])
+train_label  <- as.numeric(as.factor(df [-testIndexes,22]))-1
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- as.matrix(df [testIndexes,1:21])
+test_label <-  as.numeric(as.factor(df [testIndexes,22]))-1#as.numeric(ytest)-1
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+numberOfClasses <- length(unique(ytrain))
+xgb_params <- list("objective" = "multi:softmax",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses,
+                   "subsample"=0.7)
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+#Diabets
+
+```{r}
+
+
+Diabetes <- read.csv('diabetes_data_upload.csv',header=TRUE)
+
+ df <-Diabetes
+#df$Species <- ifelse(df$Species=='versicolor',1,0)#as.numeric(as.factor(df$Class))-1
+set.seed(42)
+
+df$Age <- as.numeric(df$Age)
+ df$Gender <- ifelse(df$Gender=='Male',1,0)
+ df$Polyuria  <- ifelse(df$Polyuria =='Yes',1,0)
+ df$Polydipsia  <- ifelse(df$Polydipsia =='Yes',1,0)
+ df$sudden.weight.loss<- ifelse(df$sudden.weight.loss=='Yes',1,0)
+
+ df$weakness  <- ifelse(df$weakness =='Yes',1,0)
+ df$Polyphagia  <- ifelse(df$Polyphagia =='Yes',1,0)
+ df$Genital.thrush <- ifelse(df$Genital.thrush=='Yes',1,0)
+ df$visual.blurring <- ifelse(df$visual.blurring =='Yes',1,0)
+ 
+ df$Itching  <- ifelse(df$Itching =='Yes',1,0)
+ df$Irritability <- ifelse(df$Irritability=='Yes',1,0)
+ df$delayed.healing <- ifelse(df$delayed.healing=='Yes',1,0)
+ df$partial.paresis<- ifelse(df$partial.paresis=='Yes',1,0)
+ 
+  df$muscle.stiffness <- ifelse(df$muscle.stiffness=='Yes',1,0)
+ df$Alopecia  <- ifelse(df$Alopecia =='Yes',1,0)
+ df$Obesity     <- ifelse(df$Obesity    =='Yes',1,0)
+ df$class<- ifelse(df$class=='Positive',1,0)
+ df<-df[complete.cases(df),]
+ 
+ #nrow(df)/nrow(Diabetes)
+ df<-df[sample(nrow(df)),]
+folds <- caret::createFolds(factor(df$class), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+
+#pbt <- ProbitBoost(xtrain,ytrain)
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:16]
+    ytest <- df[testIndexes,17]
+    xtrain <- df[-testIndexes, 1:16]
+    ytrain <- df[-testIndexes,17] 
+    names(ytrain) <- row.names(xtrain)
+    
+        ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+  
+    ### gbm
+
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli',bag.fraction = 0.7)
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    # ## RandomForest
+     ytrain <- factor(ytrain)
+        treer <- randomForest(ytrain~., data = xtrain)
+    p <-predict(treer, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+     data_adb <- df[-testIndexes,]
+     data_adb$class <- as.factor(data_adb$class)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(class~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+        train_data   <- as.matrix(df[-testIndexes,1:16])
+train_label  <- df[-testIndexes,17]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- as.matrix(df[testIndexes,1:16])
+test_label <-  df[testIndexes,17]#as.numeric(ytest)-1
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+numberOfClasses <- length(unique(ytrain))
+xgb_params <- list("objective" = "multi:softmax",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses,
+                   "subsample"=0.7)
+bst_model <- xgb.train(
+                       data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+ xgb_params10<- list("objective" = "binary:logistic",
+                   "num_class" = numberOfClasses)   
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+#Obesity
+
+```{r}
+
+Obesity <- read.csv('ObesityDataSet_raw_and_data_sinthetic.csv',header = TRUE)#read.arff(url('https://archive.ics.uci.edu/ml/machine-learning-databases/00404/OBS-Network-DataSet_2_Aug27.arff'))
+  #read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/letter-recognition/letter-recognition.data'),
+                  # sep= ",", header=FALSE)
+
+#write.csv(letter,'letter.csv')
+df <- Obesity
+library(rpart)
+set.seed(42)
+
+df$Gender <- ifelse(df$Gender=='Male',1,0)
+df$family_history_with_overweight  <- ifelse(df$family_history_with_overweight =='yes',1,0)
+df$FAVC  <- ifelse(df$FAVC =='yes',1,0)
+df$SMOKE  <- ifelse(df$SMOKE =='yes',1,0)
+df$SCC   <- ifelse(df$SCC  =='yes',1,0)
+ dmy<- dummyVars(" ~CAEC + CALC + MTRANS", data = df)
+ cat_df <-  data.frame(predict(dmy, newdata = df))
+ num_df <- df[,c('Gender','Age','Height','family_history_with_overweight','FAVC','SMOKE','SCC','Weight','FCVC','NCP','CH2O','FAF','TUE','NObeyesdad')]
+ df <- as.data.frame((cbind(cat_df,num_df)))
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Insufficient_Weight',1,df$NObeyesdad )
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Normal_Weight',2,df$NObeyesdad )
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Obesity_Type_I',3,df$NObeyesdad )
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Obesity_Type_II',4,df$NObeyesdad )
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Obesity_Type_III',5,df$NObeyesdad )
+ df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Overweight_Level_I',6,df$NObeyesdad )
+  df$NObeyesdad   <- ifelse(df$NObeyesdad  =='Overweight_Level_II',7,df$NObeyesdad )
+ # df$V2 <- as.factor(df$V2)
+ # df$V3 <- as.factor(df$V3)
+ # df$V7 <- as.factor(df$V7)
+ # df$V8<- as.factor(df$V8)
+# 
+#   dmy<- dummyVars(" ~V2 + V3+ V7+V8", data = df)
+#  cat_df <-  data.frame(predict(dmy, newdata = df))
+#  num_df <- df[,c('V1','V4','V5','V6','V9','V10')]
+# # 
+# processed_df <- as.data.frame(cbind(cat_df,num_df))
+
+
+library(RWeka)
+#Create 10 equally size folds
+df<-df[sample(nrow(df)),]
+folds <- caret::createFolds(factor(df$NObeyesdad), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:26]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,27]
+    xtrain <- df[-testIndexes, 1:26]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,27] 
+    names(ytrain) <- row.names(xtrain)
+    
+    
+        ###SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=100,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+
+# define parameters
+    lab_list = as.vector(sort(unique(ytrain)))
+    n_Class <- length(unique(ytrain))
+    boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+            for (jClass in 1:n_Class) {
+              #print('loop')
+              yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+            gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli',bag.fraction=0.7)
+    
+              boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+            }
+            pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+    
+
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    ###RandomForest 
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+         data_adb <- df [-testIndexes,]
+     data_adb$NObeyesdad<- as.factor(data_adb$NObeyesdad)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(NObeyesdad~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df [testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    ### Xgboost()
+            train_data   <- as.matrix(df [-testIndexes,1:26])
+train_label  <- as.numeric(as.factor(df [-testIndexes,27]))-1
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- as.matrix(df [testIndexes,1:26])
+test_label <-  as.numeric(as.factor(df [testIndexes,27]))-1#as.numeric(ytest)-1
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+numberOfClasses <- length(unique(ytrain))
+xgb_params <- list("objective" = "multi:softmax",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses,
+                   "subsample"=0.7)
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt <- confusionMatrix(factor(test_pred),
+                factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ###Xgboost(10)
+    
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+
+# Predict hold-out test set
+test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+xgt10 <- confusionMatrix(factor(test_pred10),
+                factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+

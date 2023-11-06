@@ -1,0 +1,532 @@
+---
+title: "vignette"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+### Ionosphere
+```{r}
+library(randomForest)
+library(dplyr)
+library(gbm)
+library(SBPMT)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(adabag)
+library(xgboost)
+ionosphere <- read.csv('ionosphere.data',
+                   sep= ",", header=FALSE)
+#n <- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/ionosphere/ionosphere.names'))
+ df <-ionosphere
+library(rpart)
+set.seed(42)
+df<-df[sample(nrow(df)),]
+df <- df[,-2]
+df[,1:33] <- as.data.frame(scale(df[,1:33]))
+df$V35 <- as.numeric(as.factor(df$V35))-1
+#Create 10 equally size folds
+folds <-  caret::createFolds(factor(df$V35), k = 10,list = FALSE) #cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+#Perform 10 fold cross validation
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 1:33]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,34]
+    xtrain <- df[-testIndexes, 1:33]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,34] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ### SBPMT
+
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=200,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+
+    ### gbm
+
+    gbm.model = gbm(ytrain~., data=xtrain, distribution = 'bernoulli')
+    pred_y = ifelse(predict.gbm(gbm.model, xtest,type='response')>0.5,1,0)
+    acct_gbm <- (sum(diag(table(pred_y,ytest))))/( sum(table(pred_y,ytest)))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+     ytrain <- factor(ytrain)
+        treer <- randomForest(ytrain~., data = xtrain)
+    p <-predict(treer, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+
+    
+    ###Adaboost
+    data_adb <- df[-testIndexes,]
+    data_adb$V35 <- as.factor(data_adb$V35)
+    #dt<- data.frame(ytrain=ytrain,xtrain=xtrain)
+    ada.model = boosting(V35~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### Xgboost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,1:33])
+    train_label  <- df[-testIndexes,34]
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,1:33])
+    test_label <-  df[testIndexes,34]#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses)
+    bst_model <- xgb.train(
+                           data = train_matrix,nrounds=100)
+    
+    test_pred <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### Xgboost(10)
+    xgb_params10<- list("objective" = "binary:logistic",
+                   "num_class" = numberOfClasses)   
+    bst_model <- xgb.train(
+                       data = train_matrix,nrounds=10)
+
+
+    test_pred10 <- ifelse(predict(bst_model, newdata = test_matrix,type = "class")>0.5,1,0)
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+    
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+### Balance scale
+
+```{r}
+
+bs<- read.csv(url('https://archive.ics.uci.edu/ml/machine-learning-databases/balance-scale/balance-scale.data'),
+                   sep= ",", header=FALSE)
+library(SBPMT)
+library(dplyr)
+library(adabag)
+library(xgboost)
+library(gbm)
+ library(caret)
+library(rpart)
+library(RWeka)
+library(randomForest)
+library(rpart)
+set.seed(42)
+df<-bs[sample(nrow(bs)),]
+
+library(RWeka)
+#Create 10 equally size folds
+folds <- caret::createFolds(factor(df$V1), k = 10,list = FALSE)#cut(seq(1,nrow(df)),breaks=10,labels=FALSE)
+
+cvpbt <- c()
+cvbpbtrf <- c() 
+cvdt <- c()
+cvgbm <- c()
+cvrf <- c()
+clmt <- c()
+cvada <- c()
+cvxg <- c()
+cvxg10 <- c()
+for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    xtest<- df[testIndexes, 2:5]
+    #xtest<- xtest[,-2]
+    ytest <- df[testIndexes,1]
+    xtrain <- df[-testIndexes, 2:5]
+    #xtrain <- xtrain[,-2]
+    ytrain <- df[-testIndexes,1] 
+    names(ytrain) <- row.names(xtrain)
+    
+    ### SBPMT
+    
+    sbpmt_pred <- SBPMT(n_tree=21,n_iteration=5,M=200,depth=6,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7)
+    rft <-table(sbpmt_pred,ytest)
+    cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+    print(cvbpbtrf[i])
+    
+
+    ### GradientBoost
+# define parameters
+    lab_list = as.vector(sort(unique(ytrain)))
+    n_Class <- length(unique(ytrain))
+    boost_feat_test<- matrix(0,ncol=n_Class,nrow=nrow(xtest))  
+    for (jClass in 1:n_Class) {
+      #print('loop')
+      yt = as.numeric(ytrain==lab_list[jClass]) # lablist[jClass]->1; rest->0
+      gbm.model = gbm(yt~., data=xtrain, distribution = 'bernoulli')
+      boost_feat_test[,jClass] <- predict.gbm(gbm.model, xtest,type='response')
+    }
+    pred_y <- apply(boost_feat_test,1,function(row) lab_list[which.max(row)] )
+    conf_mat= confusionMatrix(as.factor(pred_y),as.factor(ytest))
+    acct_gbm <- (sum(diag(conf_mat$table)))/( sum(conf_mat$table))
+    cvgbm[i] <-acct_gbm
+    print(cvgbm[i])
+    
+    ### RandomForest
+    
+
+     ytrain <- factor(ytrain)
+    tree <- randomForest(ytrain~., data = xtrain)
+    p <-predict(tree, xtest)  #ifelse(predict(tree, xtest)>0.5,1,0) #predict(tree, xtest,type = 'class') #ifelse(predict(tree, xtest,type = 'class')>0.5,1,0)
+    confmatrix_treer <-table(p, ytest)
+    acctr <- (sum(diag(confmatrix_treer)))/( sum(confmatrix_treer))
+    cvrf[i] <-acctr
+    print(cvrf[i])
+    
+    
+    ### AdaBoost
+    data_adb <- df[-testIndexes,]
+    data_adb$V1<- as.factor(data_adb$V1)
+    ada.model = boosting(V1~., data = data_adb)
+    predada = predict.boosting(ada.model , newdata=df[testIndexes,])
+    cvada[i] <- sum(diag(predada$confusion))/sum(predada$confusion)
+    print(cvada[i])
+    
+    ### XgBoost(100)
+    
+    train_data   <- as.matrix(df[-testIndexes,2:5])
+    train_label  <- as.numeric(as.factor(df[-testIndexes,1]))-1
+    train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+    # split test data and make xgb.DMatrix
+    test_data  <- as.matrix(df[testIndexes,2:5])
+    test_label <-  as.numeric(as.factor(df[testIndexes,1]))-1#as.numeric(ytest)-1
+    test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+    numberOfClasses <- length(unique(ytrain))
+    xgb_params <- list("objective" = "multi:softmax",
+                       "eval_metric" = "mlogloss",
+                       "num_class" = numberOfClasses)
+    bst_model <- xgb.train(params = xgb_params,
+                           data = train_matrix,nrounds=100)
+
+# Predict hold-out test set
+    test_pred <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt <- confusionMatrix(factor(test_pred),
+                    factor(test_label))
+    cvxg[i] <- sum(diag(xgt$table))/sum(xgt$table)
+    print(cvxg[i])
+    
+    ### XgBoost(10)
+    bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,nrounds=10)
+    test_pred10 <- predict(bst_model, newdata = test_matrix,type = "class")
+    xgt10 <- confusionMatrix(factor(test_pred10),
+                    factor(test_label))
+    cvxg10[i] <- sum(diag(xgt10$table))/sum(xgt10$table)
+    print(cvxg10[i])
+}
+
+
+cat("\nmean prediction accuracy of SBPMT:",mean(cvbpbtrf)*100) # CART
+cat("\nmean prediction accuracy of RF:",mean(cvrf)*100)
+cat("\nmean prediction accuracy of gradient boosting:",mean(cvgbm)*100)
+cat("\nmean prediction accuracy of ADB:",mean(cvada)*100)
+cat("\nmean prediction accuracy of xgboost(10):",mean(cvxg10)*100)
+cat("\nmean prediction accuracy of xgboost(100):",mean(cvxg)*100)
+
+
+cat("\nstd prediction accuracy of SBPMT:",sd(cvbpbtrf)*100) # CART
+cat("\nstd prediction accuracy of RF:",sd(cvrf)*100)
+cat("\nstd prediction accuracy of gradient boosting:",sd(cvgbm)*100)
+cat("\nstd prediction accuracy of ADB:",sd(cvada)*100)
+cat("\nstd prediction accuracy of Xgboost(10):",sd(cvxg10)*100)
+cat("\nstd prediction accuracy of Xgboost(100):",sd(cvxg)*100)
+
+```
+
+
+### Simulated set  (Mease and Wyner (2008))
+
+```{r}
+
+set.seed(1234)
+d <- 10
+X <- matrix(0,nrow=12000,ncol=d)
+eff <- c(1,3,4,5,7)
+for(col in 1:d){
+  
+  X[,col] <-  runif(12000)#rnorm(12000)
+  
+}
+
+q <- 0.8
+Y <- apply(X,1,function(row) ifelse(ifelse(sum(row[eff])>length(eff)/2,1,0)*(1-2*q)+q>0.5,1,0))
+
+df <- as.data.frame(cbind(X,Y))
+
+colnames(df) <- c(paste0("X",1:d),"Y")
+
+train_ind <- sample(1:nrow(df),2000)
+
+xtest<- df[-train_ind, 1:d]
+#xtest<- xtest[,-2]
+ytest <- df[-train_ind,11]
+xtrain <- df[train_ind, 1:d]
+#xtrain <- xtrain[,-2]
+ytrain <- df[train_ind,11] 
+names(ytrain) <- row.names(xtrain)
+
+## example
+  sbpmt_pred <- SBPMT(n_tree=10,n_iteration=1,M=50,depth=3,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7,seed=42)
+
+  rft <-table(sbpmt_pred,ytest)
+  rft
+   sum(diag(rft))/sum(rft)
+```
+
+## Subagging times
+
+```{r}
+
+# Initial setting: S=5, T=5,B=5,depth=3,step=0.5,size=20,alpha=0.7
+
+subagging_time <- 1:100
+
+test_accuracies <- c()
+
+for(s in 1:length(subagging_time)){
+  
+  sbpmt_pred <- SBPMT(n_tree=s,n_iteration=5,M=5,depth=3,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7,seed=42)
+
+  rft <-table(sbpmt_pred,ytest)
+  
+  test_accuracies[s] <- sum(diag(rft))/sum(rft)
+  
+}
+
+
+
+  #cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+#plot(test_accuracies,type='l')
+
+
+```
+
+
+```{r}
+test_acc_subag <- data.frame(subagging_time=subagging_time,test_error=1-test_accuracies)
+
+ f1<-ggplot(test_acc_subag)+
+   geom_line(aes(subagging_time,test_error),size=1,color ="red") +
+   xlab('Subagging times')+
+  ylab('Test error') +
+   theme(text = element_text(family = "serif"))+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"),panel.border  = element_rect(color = "black",fill = NA,size = 1))+
+ theme(axis.text.x = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.x=element_text(size = 16))+
+ theme(axis.text.y = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.y=element_text(size = 16))
+
+
+f1
+
+
+
+
+
+```
+
+
+## Adaboost iterations T
+
+```{r}
+
+# Initial setting: T=5,B=100,depth=6,step=0.5,size=20,alpha=0.7
+
+Ts <- 1:100
+
+test_accuracies_T <- c()
+
+for(t in 1:length(Ts)){
+  
+  sbpmt_pred <- SBPMT(n_tree=5,n_iteration=t,M=5,depth=3,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7,seed=42)
+
+  rft <-table(sbpmt_pred,ytest)
+  
+  test_accuracies_T[t] <- sum(diag(rft))/sum(rft)
+  
+}
+
+
+
+  #cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+#plot(test_accuracies_T,type='l')
+
+
+```
+
+
+```{r}
+test_acc_T <- data.frame(Ts=Ts,test_error=1-test_accuracies_T)
+
+ f2<-ggplot(test_acc_T)+
+   geom_line(aes(Ts,test_error),size=1,color ="red") +
+   xlab('AdaBoost Iterations')+
+  ylab('Test error') +
+   theme(text = element_text(family = "serif"))+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"),panel.border  = element_rect(color = "black",fill = NA,size = 1))+
+ theme(axis.text.x = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.x=element_text(size = 16))+
+ theme(axis.text.y = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.y=element_text(size = 16))
+
+
+
+f2
+
+
+
+
+
+```
+
+
+
+## Pbt iterations B
+
+```{r}
+
+# Initial setting: T=5,B=100,depth=6,step=0.5,size=20,alpha=0.7
+
+Bs <- 1:100
+
+test_accuracies_B <- c()
+
+for(b in 1:length(Bs)){
+  
+  sbpmt_pred <- SBPMT(n_tree=5,n_iteration=5,M=b,depth=3,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=0.7,seed=42)
+
+  rft <-table(sbpmt_pred,ytest)
+  
+  test_accuracies_B[b] <- sum(diag(rft))/sum(rft)
+  
+}
+
+
+
+  #cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+#plot(test_accuracies_B,type='l')
+
+
+```
+
+
+```{r}
+test_acc_B <- data.frame(Bs=Bs,test_error=1-test_accuracies_B)
+
+ f3<-ggplot(test_acc_B)+
+   geom_line(aes(Bs,test_error),size=1,color ="red") +
+   xlab('ProbitBoost Iterations')+
+  ylab('Test error') +
+   theme(text = element_text(family = "serif"))+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"),panel.border  = element_rect(color = "black",fill = NA,size = 1))+
+ theme(axis.text.x = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.x=element_text(size = 16))+
+ theme(axis.text.y = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.y=element_text(size = 16))
+
+
+
+f3
+
+
+
+
+
+```
+
+
+## alpha
+
+```{r}
+
+# Initial setting: T=5,B=100,depth=6,step=0.5,size=20,alpha=0.7
+
+alphas <- seq(0.5,1,by=0.01)
+
+test_accuracies_a <- c()
+
+for(a in 1:length(alphas)){
+  
+  sbpmt_pred <- SBPMT(n_tree=5,n_iteration=5,M=5,depth=3,xtrain=xtrain,ytrain=ytrain,xtest=xtest,step=0.5,size=20,alpha=alphas[a],seed=42)
+
+  rft <-table(sbpmt_pred,ytest)
+  
+  test_accuracies_a[a] <- sum(diag(rft))/sum(rft)
+  
+}
+
+
+
+  #cvbpbtrf[i] <- sum(diag(rft))/sum(rft)
+#plot(test_accuracies_a,type='l')
+
+
+```
+
+
+```{r}
+test_acc_A <- data.frame(As=alphas,test_error=1-test_accuracies_a)
+
+ f4<-ggplot(test_acc_A)+
+   geom_line(aes(alphas,test_error),size=1,color ="red") +
+   xlab('Subagging ratio')+
+  ylab('Test error') +
+   theme(text = element_text(family = "serif"))+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"),panel.border  = element_rect(color = "black",fill = NA,size = 1))+
+ theme(axis.text.x = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.x=element_text(size = 16))+
+ theme(axis.text.y = element_text(vjust = 0.5, hjust=1,size=16),axis.ticks.length=unit(.25, "cm"), legend.position=c(0.9,0.25),legend.key = element_rect(colour = NA, fill = NA),axis.title.y=element_text(size = 16))
+
+
+
+f4
+
+
+
+
+```
+
